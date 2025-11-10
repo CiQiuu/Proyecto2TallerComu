@@ -9,20 +9,21 @@
 #   (y opcionalmente por baja energía si activas el fallback)
 # - Demodula SSB-USB (producto + LPF) y guarda WAV fijo: "Demodulado.wav"
 #------------------------------------------------------
-# - Para ejecutar el programa: "python3 ReceptorSSB.py"
+# - Para ejectuar programa: "python3 ReceptorSSB.py"
 # - Para reproducir .wav: aplay Demodulado.wav
 # ====================================================
 
 import time
-import os
 import numpy as np
 import pyaudio
 import soundfile as sf
 from scipy.signal import butter, sosfiltfilt
-import matplotlib.pyplot as plt 
 
 #====================================
-# PARÁMETROS
+# PARÁMETROS DEL SISTEMA
+#------------------------------------
+# Ajustes de sincronía (beeps), armado por timeout, filtros SSB,
+# criterios de corte (beep final y/o energía), audio y salida.
 #====================================
 
 # Beeps del TX
@@ -39,6 +40,9 @@ REFRACTORY_S     = 0.22     # s
 R_ON             = 0.24     # umbral ON de correlación normalizada
 R_OFF            = 0.17     # umbral OFF
 
+# Timeout
+T_ARM_TIMEOUT0   = 8.0      # s si no hay beeps aún
+T_ARM_EXTEND     = 6.0      # s adicionales si ya hubo 1–2 beeps
 
 # SSB
 SSB_FC_HZ        = 12000.0  # Hz
@@ -124,12 +128,12 @@ def goertzel_power(x: np.ndarray, fs: int, f0: float) -> float:
         s1 = s0
     return (s1*s1 + s2*s2 - c*s1*s2) / (len(x) + 1e-12)
 
-#====================================================================================================
+#====================================
 # DEMODULACIÓN SSB
-
-#   ssb_demod_product: demod. por producto con coseno a fc y LPF.
+#------------------------------------
+# - ssb_demod_product: demod. por producto con coseno a fc y LPF.
 #   Normaliza la salida para evitar saturación al guardar WAV.
-#====================================================================================================
+#====================================
 
 def ssb_demod_product(sig: np.ndarray, fs: int, fc: float, phase_deg: float = 0.0):
     n = np.arange(len(sig))
@@ -140,22 +144,24 @@ def ssb_demod_product(sig: np.ndarray, fs: int, fc: float, phase_deg: float = 0.
     peak = np.max(np.abs(y)) or 1.0
     return (y/peak)*0.9
 
-#====================================================================================================
+#====================================
 # MÁQUINA DE ESTADOS
-#====================================================================================================
+#------------------------------------
+# - St: estados del RX (WAITING→ARMED→RECORD→DONE).
+#====================================
 
 class St:
     WAITING, ARMED, RECORD, DONE = range(4)
 
-#====================================================================================================
+#====================================
 # CORE DEL RECEPTOR
 #------------------------------------
-# - ciclo completo:
-#   (1) Espera patrón de 3 beeps (indefinido, sin deadlines).
+# - run_one_session: ciclo completo:
+#   (1) Espera patrón de 3 beeps.
 #   (2) Arma y graba,
 #   (3) Corta por beep final (1 kHz por 600 ms),
 #   (4) Demodula y guarda "Demodulado.wav".
-#====================================================================================================
+#====================================
 
 def run_one_session(pa: pyaudio.PyAudio):
     fs = int(FORCE_FS) if FORCE_FS else int(pa.get_default_input_device_info().get('defaultSampleRate', 48000))
@@ -166,7 +172,7 @@ def run_one_session(pa: pyaudio.PyAudio):
 
     stream = pa.open(format=pyaudio.paFloat32, channels=1, rate=fs, input=True,
                      input_device_index=INPUT_INDEX, frames_per_buffer=block)
-    print(f"\\n[RX] Fs={fs} Hz - Esperando handshake @1 kHz ({BEEP_MS:.0f} ms).")
+    print(f"\n[RX] Fs={fs} Hz - Buscando 3 beeps @1 kHz ({BEEP_MS:.0f} ms). Deben ser 3: no arma con 2.")
 
     state = St.WAITING
     t0 = time.time(); now = lambda: time.time()-t0
@@ -184,18 +190,17 @@ def run_one_session(pa: pyaudio.PyAudio):
     def corr_norm():
         xb = buf - np.mean(buf)
         num = float(np.dot(xb, templ))
-        den = float(np.sqrt(np.sum(xb*xb))*1.0)  
+        den = float(np.sqrt(np.sum(xb*xb))*1.0)  # templ unidad
         if den <= 1e-12: return 0.0
         return num/den
 
     # Detección de beeps
     r_above = False
     last_cross_end = None
-    beeps = []          
+    beeps = []          # lista de (t_start, t_end)
     first_gap = None
-    # (Eliminado: arm_deadline / arm_extended_to para deadlines)
-    # arm_deadline = now() + T_ARM_TIMEOUT0
-    # arm_extended_to = None
+    arm_deadline = now() + T_ARM_TIMEOUT0
+    arm_extended_to = None
 
     # Grabación
     rec_chunks = []
@@ -203,14 +208,14 @@ def run_one_session(pa: pyaudio.PyAudio):
     max_samples = int(MAX_RECORD_S*fs)
     rec_start = None
     stop_below_since = None
-    bp_hist = []  # historia de p_bp durante grabación 
+    bp_hist = []  # historia de p_bp durante grabación (para baseline real)
     hist_len = max(3, int(REC_ADAPT_SEC / BLOCK_S))
 
     # --- Acumuladores de tono final ---
     end_on_time = 0.0
-    end_on_time_rf = 0.0  #
-    end_on_time_bb = 0.0  
-    end_f0 = SSB_FC_HZ + BEEP_FREQ  
+    end_on_time_rf = 0.0  # ruta RF (modulado)
+    end_on_time_bb = 0.0  # ruta baseband (1 kHz crudo)
+    end_f0 = SSB_FC_HZ + BEEP_FREQ  # ~13 kHz si BEEP_FREQ=1 kHz
     last_dbg = time.time()
 
     try:
@@ -240,7 +245,7 @@ def run_one_session(pa: pyaudio.PyAudio):
                         accept = False
                         if not beeps:
                             beeps = [(beep_start, beep_end)]
-                            print("[RX] Beep 1 detectado.")
+                            print("[RX] Beep 1 detectado (corr).")
                         else:
                             prev_start, prev_end = beeps[-1]
                             gap_ee = beep_end - prev_end
@@ -260,13 +265,28 @@ def run_one_session(pa: pyaudio.PyAudio):
                             else:
                                 beeps = [(beep_start, beep_end)]
                                 first_gap = None
-                                print(f"[RX] Gap {gap_ee:.2f} s fuera de rango | reinicio.")
+                                print(f"[RX] Gap {gap_ee:.2f} s fuera de rango → reinicio suave.")
 
                         if len(beeps) == 3 and state == St.WAITING:
                             arm_time = t + 0.05
                             state = St.ARMED
-                            print("[RX] Handshake completado. Armando en 50 ms.")
+                            print("[RX] Patrón OK (3 beeps). Armando en 50 ms.")
 
+            # Timeout de armado
+            if state == St.WAITING:
+                if len(beeps) == 0 and t >= arm_deadline:
+                    state = St.ARMED
+                    arm_time = t + 0.05
+                    print("[RX] Timeout sin beeps. Armando por energía en banda.")
+                elif 1 <= len(beeps) <= 2:
+                    if arm_extended_to is None:
+                        arm_extended_to = t + T_ARM_EXTEND
+                    elif t >= arm_extended_to:
+                        beeps = []
+                        first_gap = None
+                        arm_deadline = t + T_ARM_TIMEOUT0
+                        arm_extended_to = None
+                        print("[RX] No llegaron 3 beeps a tiempo → reinicio de patrón y espera.")
 
             # Transición a grabación
             if state == St.ARMED and t >= arm_time:
@@ -367,66 +387,10 @@ def run_one_session(pa: pyaudio.PyAudio):
 
     print("[RX] Sesión OK.")
     return True, fs
-    
-# ===============================================================================================================================
-#                               GRAFICACIÓN 
-# ===============================================================================================================================
 
-def _ensure_fig_dir(base_dir):
-    figs_dir = os.path.join(base_dir, "figs")
-    os.makedirs(figs_dir, exist_ok=True)
-    return figs_dir
-
-def plot_spectrum_basic(x, fs, title, savepath):
-    nfft = min(len(x), 8192) if len(x) > 0 else 8192
-    w = np.hanning(nfft)
-    X = np.fft.rfft(x[:nfft] * w, n=nfft)
-    f = np.fft.rfftfreq(nfft, 1.0/fs)
-    psd = (np.abs(X)**2) / (np.sum(w**2) + 1e-20)
-    psd_db = 10*np.log10(psd + 1e-20)
-
-    plt.figure()
-    plt.plot(f, psd_db)
-    plt.xlabel("Frecuencia [Hz]")
-    plt.ylabel("Magnitud [dB]")
-    plt.title(title)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(savepath, dpi=120)
-    plt.close()
-
-def plot_spectrogram_basic(x, fs, title, savepath):
-    N = 1024
-    H = 256    
-    win = np.hanning(N)
-    frames = []
-    
-    for i in range(0, max(len(x)-N, 0), H):
-        seg = x[i:i+N] * win
-        X = np.fft.rfft(seg)
-        frames.append(20*np.log10(np.abs(X) + 1e-12))
-    if not frames:
-        frames = [np.zeros(N//2+1)]
-        
-    S = np.vstack(frames).T  # [frecuencias x tiempo]
-    t = np.arange(S.shape[1]) * (H/fs)
-    f = np.fft.rfftfreq(N, 1.0/fs)
-
-    plt.figure()
-    plt.pcolormesh(t, f, S, shading="auto")
-    plt.xlabel("Tiempo [s]")
-    plt.ylabel("Frecuencia [Hz]")
-    plt.title(title)
-    plt.colorbar(label="dB")
-    plt.ylim(0, fs/2)
-    plt.tight_layout()
-    plt.savefig(savepath, dpi=120)
-    plt.close()
-
-
-#====================================================================================================
-#                               MAIN
-#====================================================================================================
+#====================================
+# BUCLE PRINCIPAL
+#====================================
 
 def run_forever():
     pa = pyaudio.PyAudio()
@@ -437,7 +401,7 @@ def run_forever():
                 ok, _ = run_one_session(pa)
                 time.sleep(0.1)
             except KeyboardInterrupt:
-                print("\\n[RX] Detenido por usuario.")
+                print("\n[RX] Detenido por usuario.")
                 break
             except Exception as e:
                 print(f"[RX] Error: {e}. Reinicio…")
@@ -445,9 +409,10 @@ def run_forever():
     finally:
         pa.terminate()
 
-#====================================================================================================
-#                               Main
-#====================================================================================================
+#====================================
+# Main
+#====================================
 
 if __name__ == "__main__":
     run_forever()
+

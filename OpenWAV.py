@@ -14,6 +14,7 @@ import numpy as np
 import soundfile as sf
 import sounddevice as sd
 from scipy.signal import hilbert
+import matplotlib.pyplot as plt
 
 # ========= RUTA ================================================================================================================
 BASE_DIR = r"/home/ciqiu/Proyectos/Proyecto2TallerComu"  # Carpeta del proyecto
@@ -121,6 +122,64 @@ def play_beep_final(fs): # Reproduce un beep más largo para indicar fin de tran
     play_audio(seq, fs, gain_db=0.0, to_stereo=True, device=None, block=True)       # Reproduce secuencia
 
 
+# ================================================================
+#                       GRAFICACIÓN BÁSICA
+# ================================================================
+
+def _ensure_fig_dir(base_dir):
+    figs_dir = os.path.join(base_dir, "figs")
+    os.makedirs(figs_dir, exist_ok=True)
+    return figs_dir
+
+def plot_spectrum_basic(x, fs, title, savepath):
+
+    nfft = min(len(x), 8192) if len(x) > 0 else 8192
+    w = np.hanning(nfft)
+    X = np.fft.rfft(x[:nfft] * w, n=nfft)
+    f = np.fft.rfftfreq(nfft, 1.0/fs)
+    psd = (np.abs(X)**2) / (np.sum(w**2) + 1e-20)
+    psd_db = 10*np.log10(psd + 1e-20)
+
+    plt.figure()
+    plt.plot(f, psd_db)
+    plt.xlabel("Frecuencia [Hz]")
+    plt.ylabel("Magnitud [dB]")
+    plt.title(title)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(savepath, dpi=120)
+    plt.close()
+
+def plot_spectrogram_basic(x, fs, title, savepath):
+
+    N = 1024
+    H = 256    
+    win = np.hanning(N)
+    frames = []
+    
+    for i in range(0, max(len(x)-N, 0), H):
+        seg = x[i:i+N] * win
+        X = np.fft.rfft(seg)
+        frames.append(20*np.log10(np.abs(X) + 1e-12))
+    if not frames:
+        frames = [np.zeros(N//2+1)]
+    
+    S = np.vstack(frames).T  
+    t = np.arange(S.shape[1]) * (H/fs)
+    f = np.fft.rfftfreq(N, 1.0/fs)
+
+    plt.figure()
+    plt.pcolormesh(t, f, S, shading="auto")
+    plt.xlabel("Tiempo")
+    plt.ylabel("Frecuencia")
+    plt.title(title)
+    plt.colorbar(label="dB")
+    plt.ylim(0, fs/2)
+    plt.tight_layout()
+    plt.savefig(savepath, dpi=120)
+    plt.close()
+
+
 # ===============================================================================================================================
 #                   Main
 # ===============================================================================================================================
@@ -166,6 +225,16 @@ def main():
     print("[TX] Beep final")
     play_beep_final(fs) 
     print("[TX] Final.")
+    print("[TX] Graficando...")
+    
+    # === GRAFICACIÓN  ===
+    figs_dir = _ensure_fig_dir(BASE_DIR)
+    try:
+        plot_spectrum_basic(s_ssb, fs, "Espectro TX (SSB)", os.path.join(figs_dir, "tx_espectro.png"))
+        plot_spectrogram_basic(s_ssb, fs, "Espectrograma TX (SSB)", os.path.join(figs_dir, "tx_espectrograma.png"))
+        print(f"[GRÁFICAS] Guardadas en: {figs_dir}")
+    except Exception as e:
+        print(f"[GRÁFICAS] Aviso: no se pudieron generar: {e}")
 
 if __name__ == "__main__":
     main()
